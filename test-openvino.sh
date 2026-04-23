@@ -28,6 +28,34 @@ pause_continue() {
     read -r -p "Press Enter to continue..."
 }
 
+stop_ramalama_containers() {
+    info "Checking for running ramalama containers..."
+    local ids
+    ids=$(podman ps --filter "label=ai.ramalama" --format "{{.ID}} {{.Names}}" 2>/dev/null || true)
+    if [[ -n "$ids" ]]; then
+        warn "Running ramalama containers found. Stopping them..."
+        while IFS= read -r line; do
+            local id name
+            id=$(echo "$line" | awk '{print $1}')
+            name=$(echo "$line" | awk '{print $2}')
+            podman stop "$id" 2>/dev/null || true
+            podman rm -f "$id" 2>/dev/null || true
+        done <<< "$ids"
+        ok "All ramalama containers stopped."
+    else
+        ok "No running ramalama containers found."
+    fi
+}
+
+cleanup() {
+    echo
+    warn "Cleaning up containers..."
+    stop_ramalama_containers
+    ok "Cleanup complete."
+}
+
+trap cleanup EXIT INT TERM
+
 OS="$(uname -s)"
 
 if [[ "$OS" != "Linux" ]]; then
@@ -111,28 +139,40 @@ serve_and_query() {
     local serve_args=("${@:3}")
 
     info "--- Test: ${label} (port ${port}) ---"
-    echo "${bold}\$ ramalama serve ${serve_args[*]} --port ${port} --name ${SERVE_NAME} -c 4000 -d${reset}"
+    echo "${bold}\$ ramalama serve ${serve_args[*]} --host 0.0.0.0 --port ${port} --name ${SERVE_NAME} -c 4000 -d${reset}"
 
     ramalama serve "${serve_args[@]}" \
+        --host 0.0.0.0 \
         --port "$port" \
         --name "$SERVE_NAME" \
         -c 4000 \
         -d
 
+    local hosts=("127.0.0.1" "0.0.0.0" "localhost")
     local max_wait=120
     local elapsed=0
-    while ! curl -sf http://127.0.0.1:"$port"/health &>/dev/null; do
+    local server_host=""
+    while [[ $elapsed -lt $max_wait ]]; do
+        for h in "${hosts[@]}"; do
+            if curl -sf "http://${h}:${port}/health" &>/dev/null; then
+                server_host="$h"
+                break
+            fi
+        done
+        if [[ -n "$server_host" ]]; then break; fi
         sleep 2
         elapsed=$((elapsed + 2))
-        if [[ $elapsed -ge $max_wait ]]; then
-            ramalama stop "$SERVE_NAME" 2>/dev/null || true
-            fatal "Server did not become ready within ${max_wait}s."
-        fi
     done
+
+    if [[ -z "$server_host" ]]; then
+        ramalama stop "$SERVE_NAME" 2>/dev/null || true
+        fatal "Server did not become ready within ${max_wait}s on any host (127.0.0.1, 0.0.0.0, localhost)."
+    fi
+    ok "Server is healthy on ${server_host}:${port}"
 
     info "Querying model with prompt: \"Give me a short story with exactly 300 words\""
 
-    RESPONSE=$(curl -s http://127.0.0.1:"$port"/v1/chat/completions \
+    RESPONSE=$(curl -s "http://${server_host}:${port}/v1/chat/completions" \
         -H "Content-Type: application/json" \
         -d '{
             "model": "model",
@@ -150,6 +190,7 @@ serve_and_query() {
 
     info "Stopping server..."
     ramalama stop "$SERVE_NAME" >/dev/null 2>&1
+    podman rm -f "$SERVE_NAME" >/dev/null 2>&1 || true
     ok "${label} done.  Prompt: ${prompt_tps} t/s  |  Generation: ${predicted_tps} t/s"
     echo
 }
@@ -161,6 +202,11 @@ run_comparison() {
     echo
 
     RESULTS=()
+
+    # -- pre-flight: stop all ramalama containers --------------------------------
+    stop_ramalama_containers
+
+    echo
 
     # Test 1: Baseline (default backend, default image)
     serve_and_query "Baseline (default)" 8080 \

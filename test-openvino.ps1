@@ -10,6 +10,17 @@
 
 $ErrorActionPreference = "Stop"
 
+$WebMode    = $false
+$WebBackend = "gpu"
+for ($i = 0; $i -lt $args.Count; $i++) {
+    if ($args[$i] -eq "--web") {
+        $WebMode = $true
+        if ($i + 1 -lt $args.Count -and $args[$i + 1] -notlike "--*") {
+            $WebBackend = $args[$i + 1].ToLower()
+        }
+    }
+}
+
 $MODEL      = "llama3.2:1b-instruct-q4_0"
 $SERVE_NAME = "openvino-test"
 
@@ -38,6 +49,25 @@ function Write-Step {
 function Write-RunCmd {
     param([string]$Cmd)
     Write-Host "$ $Cmd" -ForegroundColor White
+}
+
+function Stop-RamalamaContainers {
+    Write-Info "Checking for running ramalama containers..."
+    $jsonOutput = $null
+    try { $jsonOutput = podman ps --filter "label=ai.ramalama" --format "{{.ID}} {{.Names}}" 2>$null } catch {}
+    if ($jsonOutput) {
+        Write-Warn "Running ramalama containers found. Stopping them..."
+        foreach ($line in $jsonOutput -split "`n") {
+            $parts = $line.Trim() -split '\s+', 2
+            $id   = $parts[0]
+            try { podman stop $id 2>$null | Out-Null } catch {}
+            try { podman rm -f $id 2>$null | Out-Null } catch {}
+        }
+        Write-Ok "All ramalama containers stopped."
+    }
+    else {
+        Write-Ok "No running ramalama containers found. Clean to continue."
+    }
 }
 
 function Pause-Continue {
@@ -113,18 +143,32 @@ function Test-ContainerEngine {
         Write-Ok "podman is available: $(podman --version)"
 
         # check if a podman machine is running
-        $machines = podman machine list --format "{{.Running}}" --noheading 2>$null
-        if ($machines -match "true") {
-            Write-Ok "A podman machine is running."
-            Write-RunCmd "podman machine list"
-            podman machine list
+        $machineState = $null
+        try { $machineState = podman machine inspect --format "{{.State}}" 2>$null } catch {}
+
+        if ($machineState -eq "running") {
+            Write-Ok "Podman machine is running."
+        }
+        elseif ($machineState -eq "stopped") {
+            Write-Warn "Podman machine is stopped. Starting it..."
+            $prevPref = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            podman machine start 2>$null | Out-Null
+            $ErrorActionPreference = $prevPref
+
+            $state = $null
+            try { $state = podman machine inspect --format "{{.State}}" 2>$null } catch {}
+            if ($state -ne "running") {
+                Write-Fatal "Failed to start podman machine. Please start it manually."
+            }
+            Write-Ok "Podman machine is now running."
         }
         else {
-            Write-Warn "No podman machine is currently running."
-            Write-Warn "Please open Podman Desktop and start (or create) a machine."
+            Write-Warn "No podman machine found."
+            Write-Warn "Please open Podman Desktop and create a machine."
             Write-Warn "  Download: https://podman-desktop.io"
             Write-Host ""
-            Write-Info "Once the machine is running, re-run this script."
+            Write-Info "After creating a machine, re-run this script."
             exit 1
         }
     }
@@ -153,25 +197,40 @@ function Invoke-ServeAndQuery {
     )
 
     Write-Info "--- Test: $Label (port $Port) ---"
-    Write-RunCmd "ramalama serve $($ServeArgs -join ' ') --port $Port --name $SERVE_NAME -c 4000 -d"
+    Write-RunCmd "ramalama serve $($ServeArgs -join ' ') --host 0.0.0.0 --port $Port --name $SERVE_NAME -c 4000"
 
-    & ramalama serve @ServeArgs --port $Port --name $SERVE_NAME -c 4000 -d
+    $serveAllArgs = @($ServeArgs) + @("--host", "0.0.0.0", "--port", "$Port", "--name", $SERVE_NAME, "-c", "4000")
+    Start-Process -FilePath "ramalama" -ArgumentList (@("serve") + $serveAllArgs) -WindowStyle Hidden -PassThru | Out-Null
 
+    $hosts   = @("127.0.0.1", "0.0.0.0", "localhost")
     $maxWait = 120
     $elapsed = 0
+    $serverHost = $null
+    $dotStates = @(".  ", ".. ", "...")
+    $dotIndex = 0
     while ($elapsed -lt $maxWait) {
-        try {
-            $health = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
-            if ($health.StatusCode -eq 200) { break }
-        } catch {}
+        Write-Host "`r[INFO] Waiting for server to be healthy $($dotStates[$dotIndex])" -ForegroundColor Cyan -NoNewline
+        $dotIndex = ($dotIndex + 1) % $dotStates.Count
+        foreach ($h in $hosts) {
+            try {
+                $health = Invoke-WebRequest -Uri "http://${h}:$Port/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
+                if ($health.StatusCode -eq 200) {
+                    $serverHost = $h
+                    break
+                }
+            } catch {}
+        }
+        if ($serverHost) { break }
         Start-Sleep -Seconds 2
         $elapsed += 2
     }
+    Write-Host ""
 
-    if ($elapsed -ge $maxWait) {
+    if (-not $serverHost) {
         ramalama stop $SERVE_NAME 2>$null
-        Write-Fatal "Server did not become ready within ${maxWait}s."
+        Write-Fatal "Server did not become ready within ${maxWait}s on any host (127.0.0.1, 0.0.0.0, localhost)."
     }
+    Write-Ok "Server is healthy on ${serverHost}:$Port"
 
     Write-Info 'Querying model with prompt: "Give me a short story with exactly 300 words"'
 
@@ -182,7 +241,7 @@ function Invoke-ServeAndQuery {
         )
     } | ConvertTo-Json -Depth 4
 
-    $response = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/v1/chat/completions" `
+    $response = Invoke-RestMethod -Uri "http://${serverHost}:$Port/v1/chat/completions" `
         -Method Post `
         -ContentType "application/json" `
         -Body $body
@@ -206,7 +265,8 @@ function Invoke-ServeAndQuery {
     }
 
     Write-Info "Stopping server..."
-    & ramalama stop $SERVE_NAME 2>$null
+    try { & ramalama stop $SERVE_NAME 2>$null } catch {}
+    try { podman rm -f $SERVE_NAME 2>$null | Out-Null } catch {}
     Write-Ok "$Label done.  Prompt: $promptTps t/s  |  Generation: $predictedTps t/s"
     Write-Host ""
 }
@@ -214,8 +274,13 @@ function Invoke-ServeAndQuery {
 function Run-Comparison {
     Write-Step "Part 2: OpenVINO Backend Comparison"
 
-    # Test 1: Baseline (default backend, default image)
-    Invoke-ServeAndQuery -Label "Baseline (default)" -Port 8080 `
+    # -- pre-flight: stop all ramalama containers --------------------------------
+    Stop-RamalamaContainers
+
+    Write-Host ""
+
+    # Test 1: Baseline Vulkan (default backend, default image)
+    Invoke-ServeAndQuery -Label "Baseline Vulkan" -Port 8080 `
         -ServeArgs @($MODEL, "--image", "quay.io/ramalama/ramalama:latest")
 
     # Test 2: OpenVINO CPU
@@ -243,21 +308,118 @@ function Run-Comparison {
 }
 
 # ============================================================================
+# Web Mode: Serve and open browser
+# ============================================================================
+
+function Start-WebUI {
+    $port = 8080
+
+    switch ($WebBackend) {
+        "base" {
+            $label = "Baseline Vulkan"
+            $serveArgs = @("serve", $MODEL, "--image", "quay.io/ramalama/ramalama:latest", "--host", "0.0.0.0", "--port", "$port", "--name", $SERVE_NAME, "-c", "4000")
+            $cmdDisplay = "ramalama serve $MODEL --image quay.io/ramalama/ramalama:latest --host 0.0.0.0 --port $port --name $SERVE_NAME -c 4000"
+        }
+        "cpu" {
+            $label = "OpenVINO CPU"
+            $env:GGML_OPENVINO_DEVICE = "CPU"
+            $serveArgs = @("serve", $MODEL, "--backend", "openvino", "--image", "quay.io/ramalama/openvino:latest", "--host", "0.0.0.0", "--port", "$port", "--name", $SERVE_NAME, "-c", "4000")
+            $cmdDisplay = "ramalama serve $MODEL --backend openvino --image quay.io/ramalama/openvino:latest --host 0.0.0.0 --port $port --name $SERVE_NAME -c 4000"
+        }
+        default {
+            $label = "OpenVINO GPU"
+            $env:GGML_OPENVINO_DEVICE = "GPU"
+            $serveArgs = @("serve", $MODEL, "--backend", "openvino", "--image", "quay.io/ramalama/openvino:latest", "--host", "0.0.0.0", "--port", "$port", "--name", $SERVE_NAME, "-c", "4000")
+            $cmdDisplay = "ramalama serve $MODEL --backend openvino --image quay.io/ramalama/openvino:latest --host 0.0.0.0 --port $port --name $SERVE_NAME -c 4000"
+        }
+    }
+
+    Write-Step "Web Mode: $label"
+
+    Stop-RamalamaContainers
+    Write-Host ""
+
+    Write-Info "Starting $label server on port $port..."
+    Write-RunCmd $cmdDisplay
+    Start-Process -FilePath "ramalama" -ArgumentList $serveArgs -WindowStyle Hidden -PassThru | Out-Null
+
+    $hosts   = @("127.0.0.1", "0.0.0.0", "localhost")
+    $maxWait = 120
+    $elapsed = 0
+    $serverHost = $null
+    $dotStates = @(".  ", ".. ", "...")
+    $dotIndex = 0
+    while ($elapsed -lt $maxWait) {
+        Write-Host "`r[INFO] Waiting for server to be healthy $($dotStates[$dotIndex])" -ForegroundColor Cyan -NoNewline
+        $dotIndex = ($dotIndex + 1) % $dotStates.Count
+        foreach ($h in $hosts) {
+            try {
+                $health = Invoke-WebRequest -Uri "http://${h}:$port/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
+                if ($health.StatusCode -eq 200) {
+                    $serverHost = $h
+                    break
+                }
+            } catch {}
+        }
+        if ($serverHost) { break }
+        Start-Sleep -Seconds 2
+        $elapsed += 2
+    }
+    Write-Host ""
+
+    if (-not $serverHost) {
+        Write-Fatal "Server did not become ready within ${maxWait}s."
+    }
+
+    Write-Ok "Server is healthy on ${serverHost}:$port"
+
+    $url = "http://${serverHost}:$port"
+    Write-Info "Opening browser at $url"
+    Start-Process $url
+
+    Write-Host ""
+    Write-Ok "Server is running. Press Ctrl+C to stop."
+    Write-Host ""
+
+    while ($true) { Start-Sleep -Seconds 1 }
+}
+
+# ============================================================================
 # Main
 # ============================================================================
+
+function Cleanup {
+    Write-Host ""
+    Write-Info "Running final cleanup..."
+    Stop-RamalamaContainers
+    if (Test-Path Env:\GGML_OPENVINO_DEVICE) {
+        Remove-Item Env:\GGML_OPENVINO_DEVICE
+    }
+    Write-Ok "Cleanup complete. All resources released."
+}
 
 Write-Host ""
 Write-Host "===== RamaLama OpenVINO Backend Test Script =====" -ForegroundColor White
 Write-Host ""
 
-Install-Ramalama
-Write-Host ""
-Write-Ok "Part 1 complete. Environment is ready."
+try {
+    Install-Ramalama
+    Write-Host ""
+    Write-Ok "Part 1 complete. Environment is ready."
 
-Pause-Continue
+    if ($WebMode) {
+        Start-WebUI
+    }
+    else {
+        Pause-Continue
 
-Run-Comparison
+        Run-Comparison
 
-Write-Host ""
-Write-Ok "All done!"
-Write-Host ""
+        Write-Host ""
+        Write-Ok "All done!"
+        Write-Host ""
+    }
+}
+finally {
+    Cleanup
+}
